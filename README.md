@@ -26,4 +26,6 @@ python build_exe.py
 
 ## 说明
 本程序只读设备电量,不会向设备写入任何配置。
+<img width="372" height="217" alt="image" src="https://github.com/user-attachments/assets/6c9eff88-0d13-4657-962b-1527f0bb1a4d" />
+<img width="1376" height="861" alt="image" src="https://github.com/user-attachments/assets/e9e4e51e-ad09-4725-a4a4-a6b87c27262a" />
 
