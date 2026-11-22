@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>外设桥接 · WebHID</title>
+<style>
+  :root { --bg:#f7f8fa; --card:#fff; --ink:#1f2430; --sub:#6b7280; --line:#e5e7eb; --ok:#16a34a; --warn:#d97706; --err:#dc2626; --accent:#2563eb; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:"Segoe UI","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--ink); padding:24px; }
+  .wrap { max-width:760px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .lead { color:var(--sub); font-size:13px; margin:0 0 20px; line-height:1.6; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; margin-bottom:16px; box-shadow:0 1px 3px rgba(0,0,0,.04); }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  button { border:0; border-radius:8px; padding:9px 16px; font-size:14px; cursor:pointer; background:var(--accent); color:#fff; }
+  button:hover { opacity:.9; }
+  button.ghost { background:#eef2ff; color:var(--accent); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .val { display:grid; grid-template-columns:90px 1fr; gap:8px 14px; font-size:14px; margin-top:12px; }
+  .val .k { color:var(--sub); }
+  .val .v { font-weight:600; font-variant-numeric:tabular-nums; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:600; }
+  .pill.ok { background:#dcfce7; color:var(--ok); }
+  .pill.warn { background:#fef3c7; color:var(--warn); }
+  .pill.err { background:#fee2e2; color:var(--err); }
+  #log { font-family:Consolas,monospace; font-size:12px; line-height:1.7; background:#0f172a; color:#cbd5e1; border-radius:8px; padding:12px 14px; height:230px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
+  .dpi-row { display:flex; gap:8px; align-items:center; margin-top:12px; }
+  .dpi-row input { width:100px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; font-size:14px; }
+  .tag { font-size:11px; color:var(--sub); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>外设桥接 · WebHID</h1>
+  <p class="lead">
+    此页面通过浏览器 WebHID 读取鼠标 / 键盘的电量与 DPI，并实时回传给桌面悬浮窗。
+    请在 <b>Chrome 或 Edge</b> 中打开本页，<b>首次</b>点击“连接设备”并在弹窗中勾选你的外设；
+    之后每次打开本页都会<b>自动重连</b>，无需再次授权。
+    平时可把浏览器最小化或固定标签页——<b>只要不关闭这个标签页</b>，悬浮窗就会一直显示数据。
+    关闭标签页前会有确认提醒，关闭后悬浮窗约 8 秒内回到“未检测到”。
+    <b>关闭厂商驱动（E HUB / G HUB）</b>后再连接成功率更高。
+  </p>
+
+  <div class="card">
+    <div class="row">
+      <button id="btnConnect">连接设备</button>
+      <button id="btnDisconnect" class="ghost" disabled>断开</button>
+      <span id="connState" class="pill err">未连接</span>
+      <span class="tag" id="bridgeState">回传服务：检测中…</span>
+    </div>
+    <div class="val">
+      <div class="k">鼠标电量</div><div class="v" id="mBattery">--</div>
+      <div class="k">鼠标 DPI</div><div class="v" id="mDpi">--</div>
+      <div class="k">键盘电量</div><div class="v" id="kBattery">--</div>
+      <div class="k">设备数</div><div class="v" id="devCount">0</div>
+    </div>
+    <div class="dpi-row">
+      <span class="k" style="color:var(--sub)">设置 DPI</span>
+      <input id="dpiInput" type="number" min="50" max="32000" step="50" value="1600">
+      <button id="btnSetDpi" class="ghost" disabled>写入鼠标</button>
+      <span class="tag" id="dpiMsg"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <b style="font-size:13px">运行日志</b>
+      <button id="btnClear" class="ghost" style="padding:5px 12px;font-size:12px">清空</button>
+    </div>
+    <div id="log" style="margin-top:10px"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ============================================================
+   从前行者 E HUB 网页驱动逆向的 LR V1/V2 私有协议（WebHID 版）
+   - 命令模板、generateView/CRC、电量/DPI 编解码均来自官方 bundle
+   - 通信：sendFeatureReport(reportId, data) / receiveFeatureReport(reportId)
+   ============================================================ */
+
+const $ = id => document.getElementById(id);
+let logBox = $("log");
+function log(msg) {
+  const t = new Date().toLocaleTimeString("zh-CN", {hour12:false});
+  logBox.textContent += `[${t}] ${msg}\n`;
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+// ---------- 官方协议常量 ----------
+const TN = {
+  UUID:            [33, 80, 0, 2, 79, 128],
+  WIRELESS_ONLINE: [152, 80, 0, 1, 71],
+  BASICS:          [33, 80, 0, 2, 79, 129],
+  GET_PERFORMANCE: [233, 80, 0, 10, 79, 64],
+  GET_DPI:         [233, 80, 0, 0, 79, 65],
+  DPI:             [254, 80, 9, 80, 58, 0, 22, 7, 2, 255, 255, 255],
+  FIRMWARE_INFO:   [205, 101, 58, 7, 0, 146, 1, 2, 146],
+};
+
+function generateCRC(dv) {
+  let r = 0;
+  for (let i = 1; i < dv.byteLength; i++) r += dv.getUint8(i);
+  dv.setUint8(0, r & 0xFF);
+}
+function generateView(template, length = 63) {
+  const dv = new DataView(new ArrayBuffer(length));
+  template.forEach((b, i) => dv.setUint8(i, b));
+  generateCRC(dv);
+  return dv;
+}
+function dpiVal(dpi) {
+  const r = dpi / 50 - 1;
+  return { low: (r & 0xFF) >> 0, high: ((r & 0xFF00) >> 8) & 0xFF };
+}
+// 官方 encodeSetDPI(slot, dpi, rgb, reportId=6) —— V2
+function encodeSetDPI(slot, dpi, protoV = 2) {
+  const dv = generateView(TN.DPI);
+  const l = (slot << 4) | 6;
+  const { low, high } = dpiVal(dpi);
+  dv.setUint8(6, l);
+  dv.setUint8(7, low);
+  dv.setUint8(8, high);
+  dv.setUint8(9, 0);      // rgb.r
+  dv.setInt8(10, 102);    // rgb.g
+  dv.setUint8(11, 255);   // rgb.b
+  generateCRC(dv);
+  return dv;
+}
+function encodeGetBasics() { return generateView(TN.BASICS); }
+function encodeGetDPI(slot = 0) {
+  const dv = generateView(TN.GET_DPI);
+  dv.setUint8(5, dv.getUint8(5) + slot);
+  generateCRC(dv);
+  return dv;
+}
+function encodeGetUUID() { return generateView(TN.UUID); }
+
+function hex(dv) {
+  const u = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+  return Array.from(u, b => b.toString(16).padStart(2, "0")).join(" ").toUpperCase();
+}
+
+// 官方 isReportResponse: byte[0] === 0xFA
+function isResponse(dv) { return dv.byteLength > 0 && dv.getUint8(0) === 0xFA; }
+
+// 官方 decodeGetBasics: battery = byte[6] & 0x7F, charging = byte[6] >> 7
+function decodeBasics(dv) {
+  if (dv.byteLength < 7) return null;
+  const raw = dv.getUint8(6);
+  const battery = raw & 0x7F;
+  if (battery > 100) return null;
+  return { battery, charging: !!(raw >> 7) };
+}
+// 官方 handleDpiChange: uint16 @ byte[3], LE
+function decodeDPI(dv) {
+  if (dv.byteLength < 5) return null;
+  const dpi = dv.getUint16(3, true);
+  return (dpi >= 50 && dpi <= 32000) ? dpi : null;
+}
+
+// ---------- 设备与连接状态 ----------
+let devices = [];         // HIDDevice[]
+let active = null;        // { device, reportId, protoV, kind }
+let polling = false;
+let pollTimer = null;
+let inputBattery = {};    // 被动上报的电量：按设备索引
+
+// 官方 handleReportResponse: byte[1]===5 -> BatteryChange, byte[2]=电量
+function onInputReport(e) {
+  const dv = new DataView(e.data.buffer, e.data.byteOffset, e.data.byteLength);
+  if (dv.byteLength < 3) return;
+  if (dv.getUint8(1) === 5) {
+    const lvl = dv.getUint8(2);
+    if (lvl <= 100) {
+      const idx = devices.indexOf(e.device);
+      inputBattery[idx] = lvl;
+      log(`被动电量上报 device#${idx}: ${lvl}%`);
+      pushToHost();
+    }
+  }
+}
+
+// 探测某设备可用的 reportId（官方文档：featureReports 的 id + [3,0] 兜底）
+async function probeReportIds(device) {
+  const ids = new Set([3, 0]);
+  try {
+    for (const c of (device.collections || [])) {
+      for (const r of (c.featureReports || [])) {
+        if (r.reportId != null) ids.add(r.reportId);
+      }
+    }
+  } catch (_) {}
+  return [...ids];
+}
+
+// 尝试用某 reportId + 协议版本打开（发 getUUID，校验 isResponse）
+async function tryOpen(device, reportId) {
+  for (const protoV of [2, 1]) {
+    try {
+      const req = encodeGetUUID();
+      await device.sendFeatureReport(reportId, new Uint8Array(req.buffer));
+      await sleep(60);
+      const rep = await device.receiveFeatureReport(reportId);
+      const dv = new DataView(rep.buffer, rep.byteOffset, rep.byteLength);
+      if (isResponse(dv)) {
+        log(`  ✓ reportId=${reportId} protoV=${protoV} 握手成功 (${hex(dv)})`);
+        return { reportId, protoV };
+      }
+    } catch (e) { /* 试下一个 */ }
+  }
+  return null;
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function classify(device) {
+  const name = (device.productName || "").toLowerCase();
+  if (/keyboard|键盘|k[0-9]|mini/.test(name)) return "keyboard";
+  if (/mouse|鼠标|x23|s9|h2/.test(name)) return "mouse";
+  // 用 collection 判断：有 0x0C consumer 或大量 usage 的是键盘
+  return "unknown";
+}
+
+// 打开并握手一批设备（首次授权 / 自动重连共用）
+async function openAll(devs, source) {
+  devices = devs;
+  active = [];
+  for (let i = 0; i < devices.length; i++) {
+    const d = devices[i];
+    log(`设备#${i}: ${d.productName || "?"} VID=${hex16(d.vendorId)} PID=${hex16(d.productId)}`);
+    try { if (!d.opened) await d.open(); } catch (e) { log(`  打开失败: ${e.message}`); continue; }
+    d.addEventListener("inputreport", onInputReport);
+    const ids = await probeReportIds(d);
+    let opened = null;
+    for (const rid of ids) { opened = await tryOpen(d, rid); if (opened) break; }
+    if (opened) {
+      const kind = classify(d);
+      active.push({ index: i, device: d, ...opened, kind });
+      log(`  → 识别为 ${kind}`);
+    } else {
+      log(`  ✗ 所有 reportId 握手失败（可能是非 LR 协议设备）`);
+    }
+  }
+  if (!active.length) {
+    setConn("err", source === "auto" ? "自动重连失败" : "无兼容设备");
+    log("没有设备完成协议握手。请确认连接的是前行者/狼蛛 2.4G 设备，且厂商驱动已关闭。");
+    return false;
+  }
+  setConn("ok", `已连接 ${active.length} 个`);
+  $("btnSetDpi").disabled = false;
+  startPolling();
+  pushToHost();
+  return true;
+}
+
+async function connect() {
+  if (!navigator.hid) {
+    log("✗ 当前浏览器不支持 WebHID，请使用 Chrome / Edge 89+");
+    return;
+  }
+  log("请求设备授权…");
+  try {
+    const devs = await navigator.hid.requestDevice({ filters: [] });
+    if (!devs.length) { log("未选择任何设备"); return; }
+    log(`用户选择了 ${devs.length} 个设备`);
+    await openAll(devs, "manual");
+  } catch (e) {
+    log(`连接异常: ${e.message}`);
+    setConn("err", "连接失败");
+  }
+}
+
+// 授权一次长期生效：之前授权过的设备无需再弹窗，打开页面自动重连。
+// （WebHID 权限持久保存在浏览器中，getDevices() 直接取回已授权设备。）
+async function autoConnect() {
+  if (!navigator.hid) return;
+  try {
+    const known = await navigator.hid.getDevices();
+    if (!known.length) return;
+    log(`发现 ${known.length} 个已授权设备，自动重连中…`);
+    await openAll(known, "auto");
+  } catch (e) {
+    log(`自动重连失败: ${e.message}`);
+  }
+}
+
+function hex16(n) { return "0x" + n.toString(16).toUpperCase().padStart(4, "0"); }
+function setConn(cls, text) {
+  const el = $("connState");
+  el.className = "pill " + cls;
+  el.textContent = text;
+}
+
+function startPolling() {
+  if (polling) return;
+  polling = true;
+  pollTimer = setInterval(async () => {
+    for (const a of active) {
+      try {
+        // 主动读 BASICS 电量
+        const req = encodeGetBasics();
+        await a.device.sendFeatureReport(a.reportId, new Uint8Array(req.buffer));
+        await sleep(50);
+        const rep = await a.device.receiveFeatureReport(a.reportId);
+        const dv = new DataView(rep.buffer, rep.byteOffset, rep.byteLength);
+        const b = decodeBasics(dv);
+        if (b) {
+          inputBattery[a.index] = b.battery;
+          if (a.kind === "mouse") $("mBattery").textContent = `${b.battery}% ${b.charging ? "充电" : "放电"}`;
+          if (a.kind === "keyboard") $("kBattery").textContent = `${b.battery}% ${b.charging ? "充电" : "放电"}`;
+        }
+        // 鼠标读 DPI
+        if (a.kind === "mouse") {
+          const dreq = encodeGetDPI(0);
+          await a.device.sendFeatureReport(a.reportId, new Uint8Array(dreq.buffer));
+          await sleep(50);
+          const drep = await a.device.receiveFeatureReport(a.reportId);
+          const ddv = new DataView(drep.buffer, drep.byteOffset, drep.byteLength);
+          const dpi = decodeDPI(ddv);
+          if (dpi) $("mDpi").textContent = String(dpi);
+        }
+      } catch (e) { /* 单次失败不中断轮询 */ }
+    }
+    $("devCount").textContent = String(active.length);
+    await pushToHost();
+    await checkCommand();
+  }, 1500);
+}
+
+// 汇总数据回传给 Python 悬浮窗
+let hostOk = false;
+async function pushToHost() {
+  const mouseA = active.find(a => a.kind === "mouse");
+  const kbA = active.find(a => a.kind === "keyboard");
+  const payload = {
+    mouse: mouseA ? {
+      percent: inputBattery[mouseA.index] ?? -1,
+      dpi: parseInt($("mDpi").textContent) || 0,
+    } : null,
+    keyboard: kbA ? { percent: inputBattery[kbA.index] ?? -1 } : null,
+  };
+  try {
+    const r = await fetch("/api/report", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    if (r.ok) {
+      if (!hostOk) { hostOk = true; $("bridgeState").textContent = "回传服务：已连接 ✓"; $("bridgeState").style.color = "var(--ok)"; }
+    } else throw new Error("HTTP " + r.status);
+  } catch (e) {
+    hostOk = false;
+    $("bridgeState").textContent = "回传服务：未连接（请从悬浮窗启动）";
+    $("bridgeState").style.color = "var(--err)";
+  }
+}
+
+// 轮询悬浮窗发来的 DPI 写入命令
+async function checkCommand() {
+  try {
+    const r = await fetch("/api/command");
+    if (!r.ok) return;
+    const cmd = await r.json();
+    if (!cmd || !cmd.set_dpi) return;
+    await fetch("/api/command/ack", { method: "POST" });
+    const mouseA = active.find(a => a.kind === "mouse");
+    if (!mouseA) { $("dpiMsg").textContent = "未连接鼠标"; return; }
+    const v = cmd.set_dpi;
+    // 用 BASICS 读到的 maxDpiProfile 推断档位数；默认尝试 5 档写入当前档
+    const req = encodeSetDPI(0, v, mouseA.protoV);
+    await mouseA.device.sendFeatureReport(mouseA.reportId, new Uint8Array(req.buffer));
+    $("dpiMsg").textContent = `已写入 DPI=${v}`;
+    log(`写入 DPI=${v} 完成`);
+    // 立刻回读
+    await sleep(120);
+    const dreq = encodeGetDPI(0);
+    await mouseA.device.sendFeatureReport(mouseA.reportId, new Uint8Array(dreq.buffer));
+    await sleep(60);
+    const drep = await mouseA.device.receiveFeatureReport(mouseA.reportId);
+    const dpi = decodeDPI(new DataView(drep.buffer, drep.byteOffset, drep.byteLength));
+    if (dpi) { $("mDpi").textContent = String(dpi); await pushToHost(); }
+  } catch (e) { $("dpiMsg").textContent = "写入失败: " + e.message; }
+}
+
+function disconnect() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  polling = false;
+  active.forEach(a => { try { a.device.close(); } catch (_) {} });
+  active = []; devices = []; inputBattery = {};
+  setConn("err", "已断开");
+  $("btnSetDpi").disabled = true;
+  $("mBattery").textContent = $("mDpi").textContent = $("kBattery").textContent = "--";
+  log("已断开所有设备");
+}
+
+// ---------- 事件绑定 ----------
+$("btnConnect").onclick = connect;
+$("btnDisconnect").onclick = disconnect;
+$("btnClear").onclick = () => { logBox.textContent = ""; };
+$("btnSetDpi").onclick = async () => {
+  const v = parseInt($("dpiInput").value);
+  if (!(v >= 50 && v <= 32000)) { $("dpiMsg").textContent = "DPI 需 50-32000"; return; }
+  try {
+    const r = await fetch("/api/command", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ set_dpi: v }),
+    });
+    $("dpiMsg").textContent = r.ok ? "命令已排队，等待写入…" : "排队失败";
+  } catch (e) { $("dpiMsg").textContent = "回传服务不可用"; }
+};
+
+// ---------- 关闭保护 ----------
+// 已连接时关闭/刷新标签页前先确认，防止误关断开电量显示
+window.addEventListener("beforeunload", (e) => {
+  if (active && active.length) {
+    e.preventDefault();
+    e.returnValue = "";
+    return "";
+  }
+});
+// 真正离开时立即通知程序桥接已断开（否则要等 8 秒超时才清空）
+window.addEventListener("pagehide", () => {
+  try {
+    if (active && active.length) {
+      navigator.sendBeacon("/api/report", new Blob(
+        [JSON.stringify({ mouse: null, keyboard: null, offline: true })],
+        { type: "application/json" }));
+    }
+  } catch (_) {}
+});
+
+// ---------- 页面加载 ----------
+pushToHost();
+autoConnect();   // 已授权过则直接自动重连，无需再点授权
+log("桥接页面就绪。首次使用请点“连接设备”授权；之后打开本页会自动重连。");
+</script>
+</body>
+</html>

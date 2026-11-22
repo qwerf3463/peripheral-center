@@ -1,0 +1,32 @@
+# 打包产物（发布到 Releases，不进源码仓库）
+外设控制中心.exe
+*.exe
+!run.bat
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# 构建产物
+build/
+dist/
+*.egg-info/
+.spec.bak
+
+# 运行时生成的用户数据与日志
+settings.json
+*.log
+autostart_*.bat
+*.tmp
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 空占位文件
+适配表单.txt
